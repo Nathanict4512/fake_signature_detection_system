@@ -1,16 +1,15 @@
 """
 Fake Signature Detection System using Neural Network
 Main Application File - Streamlit Interface
+Simplified version with minimal dependencies
 """
 
 import streamlit as st
 import sqlite3
 import hashlib
-import os
 from datetime import datetime
 import numpy as np
 from PIL import Image
-import cv2
 import io
 import base64
 
@@ -68,16 +67,6 @@ def init_database():
     )
     ''')
     
-    # System settings table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS system_settings (
-        setting_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        setting_name TEXT UNIQUE NOT NULL,
-        setting_value TEXT NOT NULL,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
     # Create default admin user if not exists
     cursor.execute("SELECT * FROM users WHERE username = 'admin'")
     if not cursor.fetchone():
@@ -90,7 +79,6 @@ def init_database():
     conn.commit()
     conn.close()
 
-# Helper functions
 def hash_password(password):
     """Hash password using SHA256"""
     return hashlib.sha256(password.encode()).hexdigest()
@@ -130,93 +118,72 @@ def register_user(username, password, full_name, email):
     except sqlite3.IntegrityError:
         return False, "Username or email already exists"
 
-def preprocess_signature(image):
-    """Preprocess signature image for neural network"""
-    # Convert PIL image to numpy array
+def simple_preprocess(image):
+    """Simple image preprocessing using PIL only"""
+    # Convert to grayscale
+    if image.mode != 'L':
+        image = image.convert('L')
+    
+    # Resize to standard size
+    image = image.resize((128, 128))
+    
+    # Convert to numpy array
     img_array = np.array(image)
     
-    # Convert to grayscale if needed
-    if len(img_array.shape) == 3:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img_array
+    # Simple threshold
+    threshold = 127
+    img_array = np.where(img_array < threshold, 0, 255)
     
-    # Apply threshold to remove background
-    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
-    
-    # Remove noise
-    kernel = np.ones((2, 2), np.uint8)
-    processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    
-    # Resize to standard size (128x128)
-    resized = cv2.resize(processed, (128, 128))
-    
-    # Normalize pixel values
-    normalized = resized / 255.0
+    # Normalize
+    normalized = img_array / 255.0
     
     return normalized
 
-def extract_simple_features(image):
-    """Extract simple features from signature image (simplified version)"""
-    processed = preprocess_signature(image)
+def extract_features(image):
+    """Extract simple features from signature"""
+    processed = simple_preprocess(image)
     
-    # Simple feature extraction
     features = []
     
-    # Pixel density
+    # Mean pixel value
     features.append(np.mean(processed))
     
-    # Aspect ratio (height to width ratio of non-zero pixels)
-    non_zero = np.argwhere(processed > 0.5)
-    if len(non_zero) > 0:
-        h_range = non_zero[:, 0].max() - non_zero[:, 0].min()
-        w_range = non_zero[:, 1].max() - non_zero[:, 1].min()
-        features.append(h_range / (w_range + 1))
-    else:
-        features.append(0)
+    # Standard deviation
+    features.append(np.std(processed))
     
-    # Horizontal projection
-    h_proj = np.sum(processed, axis=1)
-    features.append(np.std(h_proj))
+    # Count non-zero pixels
+    non_zero_count = np.count_nonzero(processed)
+    features.append(non_zero_count / (128 * 128))
     
-    # Vertical projection
-    v_proj = np.sum(processed, axis=0)
-    features.append(np.std(v_proj))
+    # Horizontal symmetry
+    left_half = processed[:, :64]
+    right_half = processed[:, 64:]
+    features.append(np.mean(np.abs(left_half - np.fliplr(right_half))))
     
-    # Number of transitions (black to white)
-    transitions = 0
-    for row in processed:
-        for i in range(len(row) - 1):
-            if (row[i] > 0.5 and row[i+1] <= 0.5) or (row[i] <= 0.5 and row[i+1] > 0.5):
-                transitions += 1
-    features.append(transitions / 1000.0)  # Normalize
+    # Vertical symmetry
+    top_half = processed[:64, :]
+    bottom_half = processed[64:, :]
+    features.append(np.mean(np.abs(top_half - np.flipud(bottom_half))))
     
     return np.array(features)
 
-def simple_signature_comparison(template_features, test_features):
-    """Simple signature comparison using Euclidean distance"""
-    # Calculate Euclidean distance
+def compare_signatures(template_features, test_features):
+    """Compare signature features"""
     distance = np.linalg.norm(template_features - test_features)
-    
-    # Convert distance to similarity score (0-100%)
-    # Lower distance = higher similarity
-    max_distance = 10.0  # Arbitrary maximum for normalization
+    max_distance = 2.0
     similarity = max(0, (1 - min(distance, max_distance) / max_distance)) * 100
-    
     return similarity
 
 def save_signature_template(user_id, image):
-    """Save signature template to database"""
+    """Save signature template"""
     conn = sqlite3.connect('signature_system.db')
     cursor = conn.cursor()
     
-    # Convert image to bytes
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
     
-    # Extract features
-    features = extract_simple_features(image)
+    features = extract_features(image)
     feature_bytes = features.tobytes()
     
     cursor.execute('''
@@ -228,7 +195,7 @@ def save_signature_template(user_id, image):
     conn.close()
 
 def get_user_templates(user_id):
-    """Get all templates for a user"""
+    """Get all templates for user"""
     conn = sqlite3.connect('signature_system.db')
     cursor = conn.cursor()
     
@@ -244,39 +211,32 @@ def get_user_templates(user_id):
     return templates
 
 def verify_signature(user_id, test_image):
-    """Verify signature against user templates"""
+    """Verify signature"""
     templates = get_user_templates(user_id)
     
     if not templates:
         return "No Template", 0.0
     
-    # Extract features from test signature
-    test_features = extract_simple_features(test_image)
+    test_features = extract_features(test_image)
     
-    # Compare with all templates and get average similarity
     similarities = []
     for template in templates:
         template_features = np.frombuffer(template[2], dtype=np.float64)
-        similarity = simple_signature_comparison(template_features, test_features)
+        similarity = compare_signatures(template_features, test_features)
         similarities.append(similarity)
     
     avg_similarity = np.mean(similarities)
     
-    # Determine result based on threshold
-    threshold = 70.0  # 70% similarity threshold
-    if avg_similarity >= threshold:
-        result = "Genuine"
-    else:
-        result = "Forged"
+    threshold = 70.0
+    result = "Genuine" if avg_similarity >= threshold else "Forged"
     
     return result, avg_similarity
 
 def log_verification(user_id, test_image, result, confidence):
-    """Log verification to database"""
+    """Log verification"""
     conn = sqlite3.connect('signature_system.db')
     cursor = conn.cursor()
     
-    # Convert image to bytes
     img_byte_arr = io.BytesIO()
     test_image.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
@@ -290,7 +250,7 @@ def log_verification(user_id, test_image, result, confidence):
     conn.close()
 
 def get_verification_history(user_id, limit=10):
-    """Get verification history for user"""
+    """Get verification history"""
     conn = sqlite3.connect('signature_system.db')
     cursor = conn.cursor()
     
@@ -306,7 +266,7 @@ def get_verification_history(user_id, limit=10):
     conn.close()
     return history
 
-# Session state initialization
+# Session state
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'user_id' not in st.session_state:
@@ -323,75 +283,37 @@ if 'page' not in st.session_state:
 # Initialize database
 init_database()
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .success-box {
-        padding: 1rem;
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
-        border-radius: 0.25rem;
-        color: #155724;
-    }
-    .error-box {
-        padding: 1rem;
-        background-color: #f8d7da;
-        border: 1px solid #f5c6cb;
-        border-radius: 0.25rem;
-        color: #721c24;
-    }
-    .info-box {
-        padding: 1rem;
-        background-color: #d1ecf1;
-        border: 1px solid #bee5eb;
-        border-radius: 0.25rem;
-        color: #0c5460;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Login/Registration Page
+# Login Page
 if not st.session_state.logged_in:
-    st.markdown('<h1 class="main-header">✍️ Signature Verification System</h1>', unsafe_allow_html=True)
+    st.title("✍️ Signature Verification System")
     
     tab1, tab2 = st.tabs(["Login", "Register"])
     
     with tab1:
         st.subheader("Login to Your Account")
-        
         login_username = st.text_input("Username", key="login_username")
         login_password = st.text_input("Password", type="password", key="login_password")
         
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            if st.button("Login", use_container_width=True):
-                if login_username and login_password:
-                    user = verify_user(login_username, login_password)
-                    if user:
-                        st.session_state.logged_in = True
-                        st.session_state.user_id = user[0]
-                        st.session_state.username = user[1]
-                        st.session_state.full_name = user[2]
-                        st.session_state.user_type = user[3]
-                        st.session_state.page = 'dashboard'
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password")
+        if st.button("Login", use_container_width=True):
+            if login_username and login_password:
+                user = verify_user(login_username, login_password)
+                if user:
+                    st.session_state.logged_in = True
+                    st.session_state.user_id = user[0]
+                    st.session_state.username = user[1]
+                    st.session_state.full_name = user[2]
+                    st.session_state.user_type = user[3]
+                    st.session_state.page = 'dashboard'
+                    st.rerun()
                 else:
-                    st.warning("Please enter both username and password")
+                    st.error("Invalid username or password")
+            else:
+                st.warning("Please enter both username and password")
         
         st.info("**Default Admin Login:** Username: `admin`, Password: `admin123`")
     
     with tab2:
         st.subheader("Create New Account")
-        
         reg_full_name = st.text_input("Full Name")
         reg_email = st.text_input("Email Address")
         reg_username = st.text_input("Username", key="reg_username")
@@ -404,21 +326,19 @@ if not st.session_state.logged_in:
             elif reg_password != reg_password_confirm:
                 st.error("Passwords do not match")
             elif len(reg_password) < 6:
-                st.error("Password must be at least 6 characters long")
+                st.error("Password must be at least 6 characters")
             else:
                 success, message = register_user(reg_username, reg_password, reg_full_name, reg_email)
                 if success:
-                    st.success("Registration successful! Please login with your credentials.")
+                    st.success("Registration successful! Please login.")
                 else:
                     st.error(message)
 
-# Main Application (After Login)
+# Main Application
 else:
-    # Sidebar
     with st.sidebar:
         st.title("Navigation")
         st.write(f"**Welcome, {st.session_state.full_name}!**")
-        st.write(f"*{st.session_state.user_type.title()}*")
         st.divider()
         
         if st.button("🏠 Dashboard", use_container_width=True):
@@ -437,259 +357,113 @@ else:
             st.session_state.page = 'history'
             st.rerun()
         
-        if st.session_state.user_type == 'admin':
-            st.divider()
-            st.write("**Admin Functions**")
-            if st.button("👥 Manage Users", use_container_width=True):
-                st.session_state.page = 'admin_users'
-                st.rerun()
-        
         st.divider()
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
-            st.session_state.user_id = None
-            st.session_state.username = None
-            st.session_state.full_name = None
-            st.session_state.user_type = None
-            st.session_state.page = 'login'
             st.rerun()
     
-    # Dashboard Page
     if st.session_state.page == 'dashboard':
-        st.markdown('<h1 class="main-header">📊 Dashboard</h1>', unsafe_allow_html=True)
+        st.title("📊 Dashboard")
         
-        # Statistics
         templates = get_user_templates(st.session_state.user_id)
-        history = get_verification_history(st.session_state.user_id, limit=100)
+        history = get_verification_history(st.session_state.user_id, 100)
         
         col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Signature Templates", len(templates))
-        
-        with col2:
-            st.metric("Total Verifications", len(history))
-        
-        with col3:
-            genuine_count = sum(1 for h in history if h[1] == 'Genuine')
-            st.metric("Genuine Signatures", genuine_count)
+        col1.metric("Templates", len(templates))
+        col2.metric("Verifications", len(history))
+        col3.metric("Genuine", sum(1 for h in history if h[1] == 'Genuine'))
         
         st.divider()
+        st.subheader("Recent Activity")
         
-        # Quick Actions
-        st.subheader("Quick Actions")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("✅ Verify New Signature", use_container_width=True):
-                st.session_state.page = 'verify'
-                st.rerun()
-        
-        with col2:
-            if st.button("📂 Manage Templates", use_container_width=True):
-                st.session_state.page = 'templates'
-                st.rerun()
-        
-        with col3:
-            if st.button("📊 View Full History", use_container_width=True):
-                st.session_state.page = 'history'
-                st.rerun()
-        
-        # Recent Activity
-        st.divider()
-        st.subheader("Recent Verification Activity")
-        
-        recent_history = get_verification_history(st.session_state.user_id, limit=5)
-        
-        if recent_history:
-            for log in recent_history:
-                col1, col2, col3 = st.columns([2, 2, 3])
-                
-                with col1:
-                    if log[1] == 'Genuine':
-                        st.success(f"✓ {log[1]}")
-                    else:
-                        st.error(f"✗ {log[1]}")
-                
-                with col2:
-                    st.write(f"**{log[2]:.1f}%** confidence")
-                
-                with col3:
-                    st.write(f"*{log[3]}*")
-                
-                st.divider()
-        else:
-            st.info("No verification history yet. Start by verifying a signature!")
+        recent = get_verification_history(st.session_state.user_id, 5)
+        for log in recent:
+            col1, col2, col3 = st.columns([2, 2, 3])
+            with col1:
+                if log[1] == 'Genuine':
+                    st.success(f"✓ {log[1]}")
+                else:
+                    st.error(f"✗ {log[1]}")
+            with col2:
+                st.write(f"**{log[2]:.1f}%**")
+            with col3:
+                st.write(f"*{log[3]}*")
     
-    # Verify Signature Page
     elif st.session_state.page == 'verify':
-        st.markdown('<h1 class="main-header">✅ Verify Signature</h1>', unsafe_allow_html=True)
+        st.title("✅ Verify Signature")
         
-        # Check if user has templates
         templates = get_user_templates(st.session_state.user_id)
         
         if not templates:
-            st.warning("⚠️ You don't have any signature templates yet. Please add at least one template before verifying signatures.")
+            st.warning("⚠️ Add templates first!")
             if st.button("Go to Templates"):
                 st.session_state.page = 'templates'
                 st.rerun()
         else:
-            st.info(f"You have {len(templates)} signature template(s) in the system.")
+            uploaded_file = st.file_uploader("Upload Signature", type=['png', 'jpg', 'jpeg'])
             
-            uploaded_file = st.file_uploader("Upload Signature to Verify", type=['png', 'jpg', 'jpeg'])
-            
-            if uploaded_file is not None:
-                # Display uploaded image
+            if uploaded_file:
                 image = Image.open(uploaded_file)
+                st.image(image, caption="Uploaded Signature", width=300)
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("Original Signature")
-                    st.image(image, use_container_width=True)
-                
-                with col2:
-                    st.subheader("Processed Signature")
-                    processed = preprocess_signature(image)
-                    st.image(processed, use_container_width=True, clamp=True)
-                
-                st.divider()
-                
-                if st.button("🔍 Verify Signature", use_container_width=True):
-                    with st.spinner("Verifying signature..."):
+                if st.button("🔍 Verify", use_container_width=True):
+                    with st.spinner("Verifying..."):
                         result, confidence = verify_signature(st.session_state.user_id, image)
-                        
-                        # Log verification
                         log_verification(st.session_state.user_id, image, result, confidence)
                         
-                        # Display result
-                        st.subheader("Verification Result")
-                        
                         if result == "Genuine":
-                            st.markdown(f'<div class="success-box"><h2>✅ GENUINE SIGNATURE</h2><p>Confidence Score: <strong>{confidence:.1f}%</strong></p></div>', unsafe_allow_html=True)
-                        elif result == "Forged":
-                            st.markdown(f'<div class="error-box"><h2>❌ FORGED SIGNATURE</h2><p>Confidence Score: <strong>{confidence:.1f}%</strong></p></div>', unsafe_allow_html=True)
+                            st.success(f"✅ GENUINE - {confidence:.1f}% confidence")
                         else:
-                            st.markdown(f'<div class="info-box"><h2>ℹ️ NO TEMPLATE</h2><p>Please add signature templates first.</p></div>', unsafe_allow_html=True)
+                            st.error(f"❌ FORGED - {confidence:.1f}% confidence")
                         
-                        # Confidence meter
                         st.progress(confidence / 100)
-                        
-                        st.info("This verification has been saved to your history.")
     
-    # Templates Page
     elif st.session_state.page == 'templates':
-        st.markdown('<h1 class="main-header">📂 Signature Templates</h1>', unsafe_allow_html=True)
+        st.title("📂 Signature Templates")
         
-        templates = get_user_templates(st.session_state.user_id)
+        uploaded = st.file_uploader("Upload Template", type=['png', 'jpg', 'jpeg'])
         
-        st.subheader("Add New Template")
-        
-        uploaded_template = st.file_uploader("Upload Signature Template", type=['png', 'jpg', 'jpeg'], key="template_upload")
-        
-        if uploaded_template is not None:
-            image = Image.open(uploaded_template)
+        if uploaded:
+            image = Image.open(uploaded)
+            st.image(image, width=300)
             
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.image(image, caption="Template Preview", use_container_width=True)
-            
-            with col2:
-                st.write("**Template Information**")
-                st.write(f"Image Size: {image.size}")
-                st.write(f"Format: {image.format}")
-                
-                if st.button("💾 Save Template", use_container_width=True):
-                    save_signature_template(st.session_state.user_id, image)
-                    st.success("Template saved successfully!")
-                    st.rerun()
+            if st.button("💾 Save Template"):
+                save_signature_template(st.session_state.user_id, image)
+                st.success("Template saved!")
+                st.rerun()
         
         st.divider()
-        
+        templates = get_user_templates(st.session_state.user_id)
         st.subheader(f"Your Templates ({len(templates)})")
         
         if templates:
             cols = st.columns(3)
-            
             for idx, template in enumerate(templates):
                 with cols[idx % 3]:
-                    # Convert bytes to image
                     img = Image.open(io.BytesIO(template[1]))
                     st.image(img, use_container_width=True)
                     st.caption(f"Added: {template[3][:10]}")
         else:
-            st.info("No templates yet. Upload your first signature template above!")
+            st.info("No templates yet")
     
-    # History Page
     elif st.session_state.page == 'history':
-        st.markdown('<h1 class="main-header">📊 Verification History</h1>', unsafe_allow_html=True)
+        st.title("📊 History")
         
-        history = get_verification_history(st.session_state.user_id, limit=50)
+        history = get_verification_history(st.session_state.user_id, 50)
         
         if history:
-            st.write(f"Showing last {len(history)} verifications")
-            
-            # Create table
-            st.dataframe(
-                {
-                    'ID': [h[0] for h in history],
-                    'Result': [h[1] for h in history],
-                    'Confidence': [f"{h[2]:.1f}%" for h in history],
-                    'Date & Time': [h[3] for h in history]
-                },
-                use_container_width=True
-            )
-            
-            # Statistics
-            st.divider()
-            st.subheader("Statistics")
-            
-            genuine_count = sum(1 for h in history if h[1] == 'Genuine')
-            forged_count = sum(1 for h in history if h[1] == 'Forged')
-            avg_confidence = np.mean([h[2] for h in history])
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Genuine", genuine_count)
-            
-            with col2:
-                st.metric("Forged", forged_count)
-            
-            with col3:
-                st.metric("Avg Confidence", f"{avg_confidence:.1f}%")
+            for log in history:
+                col1, col2, col3, col4 = st.columns([1, 2, 2, 3])
+                with col1:
+                    st.write(f"#{log[0]}")
+                with col2:
+                    if log[1] == 'Genuine':
+                        st.success(log[1])
+                    else:
+                        st.error(log[1])
+                with col3:
+                    st.write(f"{log[2]:.1f}%")
+                with col4:
+                    st.write(log[3])
         else:
-            st.info("No verification history yet.")
-    
-    # Admin Users Page
-    elif st.session_state.page == 'admin_users' and st.session_state.user_type == 'admin':
-        st.markdown('<h1 class="main-header">👥 User Management</h1>', unsafe_allow_html=True)
-        
-        conn = sqlite3.connect('signature_system.db')
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT user_id, username, full_name, email, user_type, created_at, is_active
-        FROM users
-        ORDER BY created_at DESC
-        ''')
-        
-        users = cursor.fetchall()
-        conn.close()
-        
-        st.dataframe(
-            {
-                'ID': [u[0] for u in users],
-                'Username': [u[1] for u in users],
-                'Full Name': [u[2] for u in users],
-                'Email': [u[3] for u in users],
-                'Type': [u[4] for u in users],
-                'Created': [u[5][:10] for u in users],
-                'Active': ['Yes' if u[6] else 'No' for u in users]
-            },
-            use_container_width=True
-        )
-        
-        st.metric("Total Users", len(users))
+            st.info("No history yet")
