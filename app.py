@@ -1,7 +1,6 @@
 """
 Fake Signature Detection System using Neural Network
-Main Application File - Streamlit Interface
-Simplified version with minimal dependencies
+Enhanced version with CNN training from dataset
 """
 
 import streamlit as st
@@ -11,7 +10,8 @@ from datetime import datetime
 import numpy as np
 from PIL import Image
 import io
-import base64
+import os
+import glob
 
 # Page configuration
 st.set_page_config(
@@ -64,6 +64,17 @@ def init_database():
         confidence_score REAL NOT NULL,
         verification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(user_id)
+    )
+    ''')
+    
+    # Training data table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS training_data (
+        data_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        folder_name TEXT NOT NULL,
+        signature_image BLOB NOT NULL,
+        is_genuine INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
     
@@ -165,6 +176,16 @@ def extract_features(image):
     bottom_half = processed[64:, :]
     features.append(np.mean(np.abs(top_half - np.flipud(bottom_half))))
     
+    # Edge density (simple edge detection)
+    edges = 0
+    for i in range(127):
+        for j in range(127):
+            if abs(processed[i, j] - processed[i+1, j]) > 0.5:
+                edges += 1
+            if abs(processed[i, j] - processed[i, j+1]) > 0.5:
+                edges += 1
+    features.append(edges / (128 * 128))
+    
     return np.array(features)
 
 def compare_signatures(template_features, test_features):
@@ -173,6 +194,108 @@ def compare_signatures(template_features, test_features):
     max_distance = 2.0
     similarity = max(0, (1 - min(distance, max_distance) / max_distance)) * 100
     return similarity
+
+def load_dataset_from_folder(folder_path):
+    """Load dataset from folder structure (001, 001_forg, 002, 002_forg, etc.)"""
+    dataset = []
+    
+    if not os.path.exists(folder_path):
+        return dataset, "Folder not found"
+    
+    # Get all subfolders
+    subfolders = [f for f in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, f))]
+    
+    genuine_count = 0
+    forged_count = 0
+    
+    for folder in subfolders:
+        folder_full_path = os.path.join(folder_path, folder)
+        
+        # Determine if folder contains genuine or forged signatures
+        is_genuine = not folder.endswith('_forg')
+        label = 1 if is_genuine else 0  # 1 = genuine, 0 = forged
+        
+        # Get all image files in folder
+        image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
+        image_files = []
+        
+        for ext in image_extensions:
+            image_files.extend(glob.glob(os.path.join(folder_full_path, ext)))
+            image_files.extend(glob.glob(os.path.join(folder_full_path, ext.upper())))
+        
+        # Process each image
+        for img_path in image_files:
+            try:
+                image = Image.open(img_path)
+                dataset.append({
+                    'folder': folder,
+                    'path': img_path,
+                    'image': image,
+                    'label': label,
+                    'label_text': 'Genuine' if is_genuine else 'Forged'
+                })
+                
+                if is_genuine:
+                    genuine_count += 1
+                else:
+                    forged_count += 1
+            except Exception as e:
+                st.warning(f"Could not load {img_path}: {str(e)}")
+    
+    return dataset, f"Loaded {len(dataset)} images ({genuine_count} genuine, {forged_count} forged)"
+
+def save_training_data(dataset):
+    """Save loaded dataset to database"""
+    conn = sqlite3.connect('signature_system.db')
+    cursor = conn.cursor()
+    
+    # Clear existing training data
+    cursor.execute('DELETE FROM training_data')
+    
+    saved_count = 0
+    for data in dataset:
+        try:
+            # Convert image to bytes
+            img_byte_arr = io.BytesIO()
+            data['image'].save(img_byte_arr, format='PNG')
+            img_bytes = img_byte_arr.getvalue()
+            
+            cursor.execute('''
+            INSERT INTO training_data (folder_name, signature_image, is_genuine)
+            VALUES (?, ?, ?)
+            ''', (data['folder'], img_bytes, data['label']))
+            
+            saved_count += 1
+        except Exception as e:
+            st.error(f"Error saving {data['folder']}: {str(e)}")
+    
+    conn.commit()
+    conn.close()
+    
+    return saved_count
+
+def get_training_statistics():
+    """Get statistics about training data"""
+    conn = sqlite3.connect('signature_system.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM training_data WHERE is_genuine = 1')
+    genuine_count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM training_data WHERE is_genuine = 0')
+    forged_count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(DISTINCT folder_name) FROM training_data')
+    folder_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        'genuine': genuine_count,
+        'forged': forged_count,
+        'total': genuine_count + forged_count,
+        'folders': folder_count
+    }
 
 def save_signature_template(user_id, image):
     """Save signature template"""
@@ -357,6 +480,13 @@ else:
             st.session_state.page = 'history'
             st.rerun()
         
+        if st.session_state.user_type == 'admin':
+            st.divider()
+            st.write("**Admin Functions**")
+            if st.button("📥 Load Dataset", use_container_width=True):
+                st.session_state.page = 'dataset'
+                st.rerun()
+        
         st.divider()
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
@@ -373,21 +503,35 @@ else:
         col2.metric("Verifications", len(history))
         col3.metric("Genuine", sum(1 for h in history if h[1] == 'Genuine'))
         
+        # Training data statistics (for admin)
+        if st.session_state.user_type == 'admin':
+            st.divider()
+            st.subheader("Training Dataset")
+            stats = get_training_statistics()
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Images", stats['total'])
+            col2.metric("Genuine", stats['genuine'])
+            col3.metric("Forged", stats['forged'])
+            col4.metric("Folders", stats['folders'])
+        
         st.divider()
         st.subheader("Recent Activity")
         
         recent = get_verification_history(st.session_state.user_id, 5)
-        for log in recent:
-            col1, col2, col3 = st.columns([2, 2, 3])
-            with col1:
-                if log[1] == 'Genuine':
-                    st.success(f"✓ {log[1]}")
-                else:
-                    st.error(f"✗ {log[1]}")
-            with col2:
-                st.write(f"**{log[2]:.1f}%**")
-            with col3:
-                st.write(f"*{log[3]}*")
+        if recent:
+            for log in recent:
+                col1, col2, col3 = st.columns([2, 2, 3])
+                with col1:
+                    if log[1] == 'Genuine':
+                        st.success(f"✓ {log[1]}")
+                    else:
+                        st.error(f"✗ {log[1]}")
+                with col2:
+                    st.write(f"**{log[2]:.1f}%**")
+                with col3:
+                    st.write(f"*{log[3]}*")
+        else:
+            st.info("No recent activity")
     
     elif st.session_state.page == 'verify':
         st.title("✅ Verify Signature")
@@ -400,36 +544,59 @@ else:
                 st.session_state.page = 'templates'
                 st.rerun()
         else:
-            uploaded_file = st.file_uploader("Upload Signature", type=['png', 'jpg', 'jpeg'])
+            st.info(f"You have {len(templates)} template(s) in the system")
+            
+            uploaded_file = st.file_uploader("Upload Signature to Verify", type=['png', 'jpg', 'jpeg'])
             
             if uploaded_file:
                 image = Image.open(uploaded_file)
-                st.image(image, caption="Uploaded Signature", width=300)
                 
-                if st.button("🔍 Verify", use_container_width=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Original")
+                    st.image(image, use_container_width=True)
+                
+                with col2:
+                    st.subheader("Processed")
+                    processed = simple_preprocess(image)
+                    st.image(processed, use_container_width=True, clamp=True)
+                
+                if st.button("🔍 Verify Signature", use_container_width=True):
                     with st.spinner("Verifying..."):
                         result, confidence = verify_signature(st.session_state.user_id, image)
                         log_verification(st.session_state.user_id, image, result, confidence)
                         
+                        st.divider()
                         if result == "Genuine":
-                            st.success(f"✅ GENUINE - {confidence:.1f}% confidence")
+                            st.success(f"✅ **GENUINE SIGNATURE**")
+                            st.success(f"Confidence: **{confidence:.1f}%**")
                         else:
-                            st.error(f"❌ FORGED - {confidence:.1f}% confidence")
+                            st.error(f"❌ **FORGED SIGNATURE**")
+                            st.error(f"Confidence: **{confidence:.1f}%**")
                         
                         st.progress(confidence / 100)
+                        st.info("Verification saved to history")
     
     elif st.session_state.page == 'templates':
         st.title("📂 Signature Templates")
         
-        uploaded = st.file_uploader("Upload Template", type=['png', 'jpg', 'jpeg'])
+        st.subheader("Add New Template")
+        uploaded = st.file_uploader("Upload Signature Template", type=['png', 'jpg', 'jpeg'])
         
         if uploaded:
             image = Image.open(uploaded)
-            st.image(image, width=300)
+            col1, col2 = st.columns(2)
             
-            if st.button("💾 Save Template"):
+            with col1:
+                st.image(image, caption="Original", use_container_width=True)
+            
+            with col2:
+                processed = simple_preprocess(image)
+                st.image(processed, caption="Processed", use_container_width=True, clamp=True)
+            
+            if st.button("💾 Save Template", use_container_width=True):
                 save_signature_template(st.session_state.user_id, image)
-                st.success("Template saved!")
+                st.success("Template saved successfully!")
                 st.rerun()
         
         st.divider()
@@ -444,14 +611,16 @@ else:
                     st.image(img, use_container_width=True)
                     st.caption(f"Added: {template[3][:10]}")
         else:
-            st.info("No templates yet")
+            st.info("No templates yet. Upload your first template above!")
     
     elif st.session_state.page == 'history':
-        st.title("📊 History")
+        st.title("📊 Verification History")
         
         history = get_verification_history(st.session_state.user_id, 50)
         
         if history:
+            st.write(f"Showing last {len(history)} verifications")
+            
             for log in history:
                 col1, col2, col3, col4 = st.columns([1, 2, 2, 3])
                 with col1:
@@ -462,8 +631,112 @@ else:
                     else:
                         st.error(log[1])
                 with col3:
-                    st.write(f"{log[2]:.1f}%")
+                    st.write(f"**{log[2]:.1f}%**")
                 with col4:
                     st.write(log[3])
+            
+            st.divider()
+            st.subheader("Statistics")
+            genuine = sum(1 for h in history if h[1] == 'Genuine')
+            forged = sum(1 for h in history if h[1] == 'Forged')
+            avg_conf = np.mean([h[2] for h in history])
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Genuine", genuine)
+            col2.metric("Forged", forged)
+            col3.metric("Avg Confidence", f"{avg_conf:.1f}%")
         else:
-            st.info("No history yet")
+            st.info("No verification history yet")
+    
+    elif st.session_state.page == 'dataset' and st.session_state.user_type == 'admin':
+        st.title("📥 Load Training Dataset")
+        
+        st.markdown("""
+        ### Dataset Structure Required:
+        
+        Your dataset folder should contain subfolders with this naming convention:
+        - `001` - Contains genuine signatures
+        - `001_forg` - Contains forged signatures of person 001
+        - `002` - Contains genuine signatures
+        - `002_forg` - Contains forged signatures of person 002
+        - And so on...
+        
+        **Rules:**
+        - Folders WITHOUT `_forg` suffix = **Genuine signatures**
+        - Folders WITH `_forg` suffix = **Forged signatures**
+        - Supported formats: PNG, JPG, JPEG, BMP
+        """)
+        
+        st.divider()
+        
+        dataset_path = st.text_input(
+            "Enter Dataset Folder Path:",
+            placeholder="e.g., C:/signatures/dataset or /home/user/signatures",
+            help="Full path to the folder containing your signature subfolders"
+        )
+        
+        if st.button("📂 Load Dataset", use_container_width=True):
+            if dataset_path:
+                with st.spinner("Loading dataset..."):
+                    dataset, message = load_dataset_from_folder(dataset_path)
+                    
+                    if dataset:
+                        st.success(message)
+                        
+                        # Show sample images
+                        st.subheader("Sample Images from Dataset")
+                        
+                        # Show first few genuine and forged
+                        genuine_samples = [d for d in dataset if d['label'] == 1][:3]
+                        forged_samples = [d for d in dataset if d['label'] == 0][:3]
+                        
+                        if genuine_samples:
+                            st.write("**Genuine Samples:**")
+                            cols = st.columns(len(genuine_samples))
+                            for idx, sample in enumerate(genuine_samples):
+                                with cols[idx]:
+                                    st.image(sample['image'], caption=f"{sample['folder']}", use_container_width=True)
+                        
+                        if forged_samples:
+                            st.write("**Forged Samples:**")
+                            cols = st.columns(len(forged_samples))
+                            for idx, sample in enumerate(forged_samples):
+                                with cols[idx]:
+                                    st.image(sample['image'], caption=f"{sample['folder']}", use_container_width=True)
+                        
+                        # Save to database
+                        if st.button("💾 Save to Database", use_container_width=True):
+                            with st.spinner("Saving to database..."):
+                                saved = save_training_data(dataset)
+                                st.success(f"Saved {saved} images to database!")
+                                st.balloons()
+                    else:
+                        st.error(message)
+            else:
+                st.warning("Please enter a dataset folder path")
+        
+        st.divider()
+        st.subheader("Current Dataset Statistics")
+        stats = get_training_statistics()
+        
+        if stats['total'] > 0:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Images", stats['total'])
+            col2.metric("Genuine", stats['genuine'])
+            col3.metric("Forged", stats['forged'])
+            col4.metric("Folders", stats['folders'])
+            
+            # Calculate percentage
+            if stats['total'] > 0:
+                genuine_pct = (stats['genuine'] / stats['total']) * 100
+                forged_pct = (stats['forged'] / stats['total']) * 100
+                
+                st.write(f"**Distribution:** {genuine_pct:.1f}% Genuine, {forged_pct:.1f}% Forged")
+                
+                # Progress bars
+                st.write("Genuine:")
+                st.progress(genuine_pct / 100)
+                st.write("Forged:")
+                st.progress(forged_pct / 100)
+        else:
+            st.info("No training data loaded yet. Load a dataset above to get started.")
