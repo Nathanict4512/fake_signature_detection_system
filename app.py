@@ -1,10 +1,9 @@
 """
 Fake Signature Detection System using Neural Network
-Enhanced version with ZIP dataset upload
+Persistent Storage Version - Data survives app restarts
 """
 
 import streamlit as st
-import sqlite3
 import hashlib
 from datetime import datetime
 import numpy as np
@@ -14,6 +13,8 @@ import os
 import zipfile
 import tempfile
 import shutil
+import pickle
+import json
 
 # Page configuration
 st.set_page_config(
@@ -23,74 +24,60 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Database initialization
-def init_database():
-    """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+# Persistent storage directory
+STORAGE_DIR = "persistent_data"
+USERS_FILE = os.path.join(STORAGE_DIR, "users.pkl")
+TEMPLATES_FILE = os.path.join(STORAGE_DIR, "templates.pkl")
+LOGS_FILE = os.path.join(STORAGE_DIR, "logs.pkl")
+DATASET_FILE = os.path.join(STORAGE_DIR, "dataset.pkl")
+
+# Create storage directory if it doesn't exist
+if not os.path.exists(STORAGE_DIR):
+    os.makedirs(STORAGE_DIR)
+
+# Initialize storage files
+def init_storage():
+    """Initialize persistent storage files"""
+    if not os.path.exists(USERS_FILE):
+        # Create default admin user
+        users = {
+            1: {
+                'user_id': 1,
+                'username': 'admin',
+                'password_hash': hash_password('admin123'),
+                'full_name': 'System Administrator',
+                'email': 'admin@system.com',
+                'user_type': 'admin',
+                'created_at': datetime.now().isoformat(),
+                'is_active': 1
+            }
+        }
+        save_data(USERS_FILE, users)
     
-    # Users table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        full_name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        user_type TEXT DEFAULT 'user',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_active INTEGER DEFAULT 1
-    )
-    ''')
+    if not os.path.exists(TEMPLATES_FILE):
+        save_data(TEMPLATES_FILE, {})
     
-    # Signature templates table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS signature_templates (
-        template_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        signature_image BLOB NOT NULL,
-        feature_vector BLOB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_active INTEGER DEFAULT 1,
-        FOREIGN KEY (user_id) REFERENCES users(user_id)
-    )
-    ''')
+    if not os.path.exists(LOGS_FILE):
+        save_data(LOGS_FILE, [])
     
-    # Verification logs table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS verification_logs (
-        log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        test_signature BLOB NOT NULL,
-        result TEXT NOT NULL,
-        confidence_score REAL NOT NULL,
-        verification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(user_id)
-    )
-    ''')
-    
-    # Training data table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS training_data (
-        data_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        folder_name TEXT NOT NULL,
-        signature_image BLOB NOT NULL,
-        is_genuine INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Create default admin user if not exists
-    cursor.execute("SELECT * FROM users WHERE username = 'admin'")
-    if not cursor.fetchone():
-        admin_password = hash_password('admin123')
-        cursor.execute('''
-        INSERT INTO users (username, password_hash, full_name, email, user_type)
-        VALUES (?, ?, ?, ?, ?)
-        ''', ('admin', admin_password, 'System Administrator', 'admin@system.com', 'admin'))
-    
-    conn.commit()
-    conn.close()
+    if not os.path.exists(DATASET_FILE):
+        save_data(DATASET_FILE, {
+            'images': [],
+            'statistics': {'genuine': 0, 'forged': 0, 'total': 0, 'folders': 0}
+        })
+
+def save_data(filepath, data):
+    """Save data to pickle file"""
+    with open(filepath, 'wb') as f:
+        pickle.dump(data, f)
+
+def load_data(filepath):
+    """Load data from pickle file"""
+    try:
+        with open(filepath, 'rb') as f:
+            return pickle.load(f)
+    except:
+        return None
 
 def hash_password(password):
     """Hash password using SHA256"""
@@ -98,41 +85,46 @@ def hash_password(password):
 
 def verify_user(username, password):
     """Verify user credentials"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+    users = load_data(USERS_FILE)
+    if not users:
+        return None
     
     password_hash = hash_password(password)
-    cursor.execute('''
-    SELECT user_id, username, full_name, user_type 
-    FROM users 
-    WHERE username = ? AND password_hash = ? AND is_active = 1
-    ''', (username, password_hash))
+    for user in users.values():
+        if user['username'] == username and user['password_hash'] == password_hash and user['is_active'] == 1:
+            return (user['user_id'], user['username'], user['full_name'], user['user_type'])
     
-    user = cursor.fetchone()
-    conn.close()
-    return user
+    return None
 
 def register_user(username, password, full_name, email):
     """Register new user"""
-    try:
-        conn = sqlite3.connect('signature_system.db')
-        cursor = conn.cursor()
-        
-        password_hash = hash_password(password)
-        cursor.execute('''
-        INSERT INTO users (username, password_hash, full_name, email)
-        VALUES (?, ?, ?, ?)
-        ''', (username, password_hash, full_name, email))
-        
-        conn.commit()
-        user_id = cursor.lastrowid
-        conn.close()
-        return True, user_id
-    except sqlite3.IntegrityError:
-        return False, "Username or email already exists"
+    users = load_data(USERS_FILE)
+    
+    # Check if username or email exists
+    for user in users.values():
+        if user['username'] == username or user['email'] == email:
+            return False, "Username or email already exists"
+    
+    # Create new user
+    user_id = max(users.keys()) + 1 if users else 1
+    password_hash = hash_password(password)
+    
+    users[user_id] = {
+        'user_id': user_id,
+        'username': username,
+        'password_hash': password_hash,
+        'full_name': full_name,
+        'email': email,
+        'user_type': 'user',
+        'created_at': datetime.now().isoformat(),
+        'is_active': 1
+    }
+    
+    save_data(USERS_FILE, users)
+    return True, user_id
 
 def simple_preprocess(image):
-    """Simple image preprocessing using PIL only"""
+    """Simple image preprocessing"""
     if image.mode != 'L':
         image = image.convert('L')
     
@@ -145,7 +137,7 @@ def simple_preprocess(image):
     return normalized
 
 def extract_features(image):
-    """Extract simple features from signature"""
+    """Extract features from signature"""
     processed = simple_preprocess(image)
     features = []
     
@@ -181,160 +173,42 @@ def compare_signatures(template_features, test_features):
     similarity = max(0, (1 - min(distance, max_distance) / max_distance)) * 100
     return similarity
 
-def load_dataset_from_zip(zip_file):
-    """Load dataset from uploaded ZIP file"""
-    dataset = []
-    genuine_count = 0
-    forged_count = 0
-    
-    # Create temporary directory
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        # Extract ZIP file
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-        
-        # Find all folders
-        for root, dirs, files in os.walk(temp_dir):
-            # Skip the root temp directory itself
-            if root == temp_dir:
-                continue
-            
-            # Get folder name
-            folder_name = os.path.basename(root)
-            
-            # Skip hidden folders and __MACOSX
-            if folder_name.startswith('.') or folder_name == '__MACOSX':
-                continue
-            
-            # Determine if genuine or forged
-            is_genuine = not folder_name.endswith('_forg')
-            label = 1 if is_genuine else 0
-            
-            # Process images in this folder
-            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG', '.BMP')
-            
-            for filename in files:
-                if filename.endswith(image_extensions) and not filename.startswith('.'):
-                    img_path = os.path.join(root, filename)
-                    
-                    try:
-                        image = Image.open(img_path)
-                        dataset.append({
-                            'folder': folder_name,
-                            'filename': filename,
-                            'image': image.copy(),  # Make a copy
-                            'label': label,
-                            'label_text': 'Genuine' if is_genuine else 'Forged'
-                        })
-                        
-                        if is_genuine:
-                            genuine_count += 1
-                        else:
-                            forged_count += 1
-                    except Exception as e:
-                        st.warning(f"Could not load {filename}: {str(e)}")
-        
-        # Clean up temp directory
-        shutil.rmtree(temp_dir)
-        
-        if len(dataset) == 0:
-            return dataset, "No valid images found in ZIP file"
-        
-        return dataset, f"Loaded {len(dataset)} images ({genuine_count} genuine, {forged_count} forged)"
-        
-    except Exception as e:
-        shutil.rmtree(temp_dir)
-        return [], f"Error processing ZIP file: {str(e)}"
-
-def save_training_data(dataset):
-    """Save loaded dataset to database"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
-    
-    # Clear existing training data
-    cursor.execute('DELETE FROM training_data')
-    
-    saved_count = 0
-    for data in dataset:
-        try:
-            img_byte_arr = io.BytesIO()
-            data['image'].save(img_byte_arr, format='PNG')
-            img_bytes = img_byte_arr.getvalue()
-            
-            cursor.execute('''
-            INSERT INTO training_data (folder_name, signature_image, is_genuine)
-            VALUES (?, ?, ?)
-            ''', (data['folder'], img_bytes, data['label']))
-            
-            saved_count += 1
-        except Exception as e:
-            st.error(f"Error saving {data['folder']}/{data['filename']}: {str(e)}")
-    
-    conn.commit()
-    conn.close()
-    
-    return saved_count
-
-def get_training_statistics():
-    """Get statistics about training data"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM training_data WHERE is_genuine = 1')
-    genuine_count = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM training_data WHERE is_genuine = 0')
-    forged_count = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(DISTINCT folder_name) FROM training_data')
-    folder_count = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    return {
-        'genuine': genuine_count,
-        'forged': forged_count,
-        'total': genuine_count + forged_count,
-        'folders': folder_count
-    }
-
 def save_signature_template(user_id, image):
     """Save signature template"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+    templates = load_data(TEMPLATES_FILE)
     
+    # Convert image to bytes
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
     
+    # Extract features
     features = extract_features(image)
-    feature_bytes = features.tobytes()
     
-    cursor.execute('''
-    INSERT INTO signature_templates (user_id, signature_image, feature_vector)
-    VALUES (?, ?, ?)
-    ''', (user_id, img_bytes, feature_bytes))
+    # Create template
+    if user_id not in templates:
+        templates[user_id] = []
     
-    conn.commit()
-    conn.close()
+    template_id = len(templates[user_id]) + 1
+    templates[user_id].append({
+        'template_id': template_id,
+        'signature_image': img_bytes,
+        'feature_vector': features.tolist(),
+        'created_at': datetime.now().isoformat(),
+        'is_active': 1
+    })
+    
+    save_data(TEMPLATES_FILE, templates)
 
 def get_user_templates(user_id):
     """Get all templates for user"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+    templates = load_data(TEMPLATES_FILE)
     
-    cursor.execute('''
-    SELECT template_id, signature_image, feature_vector, created_at
-    FROM signature_templates
-    WHERE user_id = ? AND is_active = 1
-    ORDER BY created_at DESC
-    ''', (user_id,))
+    if user_id not in templates:
+        return []
     
-    templates = cursor.fetchall()
-    conn.close()
-    return templates
+    return [(t['template_id'], t['signature_image'], np.array(t['feature_vector']), t['created_at']) 
+            for t in templates[user_id] if t['is_active'] == 1]
 
 def verify_signature(user_id, test_image):
     """Verify signature"""
@@ -347,12 +221,11 @@ def verify_signature(user_id, test_image):
     
     similarities = []
     for template in templates:
-        template_features = np.frombuffer(template[2], dtype=np.float64)
+        template_features = template[2]
         similarity = compare_signatures(template_features, test_features)
         similarities.append(similarity)
     
     avg_similarity = np.mean(similarities)
-    
     threshold = 70.0
     result = "Genuine" if avg_similarity >= threshold else "Forged"
     
@@ -360,37 +233,135 @@ def verify_signature(user_id, test_image):
 
 def log_verification(user_id, test_image, result, confidence):
     """Log verification"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+    logs = load_data(LOGS_FILE)
     
+    # Convert image to bytes
     img_byte_arr = io.BytesIO()
     test_image.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
     
-    cursor.execute('''
-    INSERT INTO verification_logs (user_id, test_signature, result, confidence_score)
-    VALUES (?, ?, ?, ?)
-    ''', (user_id, img_bytes, result, confidence))
+    log_entry = {
+        'log_id': len(logs) + 1,
+        'user_id': user_id,
+        'test_signature': img_bytes,
+        'result': result,
+        'confidence_score': confidence,
+        'verification_time': datetime.now().isoformat()
+    }
     
-    conn.commit()
-    conn.close()
+    logs.append(log_entry)
+    save_data(LOGS_FILE, logs)
 
 def get_verification_history(user_id, limit=10):
     """Get verification history"""
-    conn = sqlite3.connect('signature_system.db')
-    cursor = conn.cursor()
+    logs = load_data(LOGS_FILE)
     
-    cursor.execute('''
-    SELECT log_id, result, confidence_score, verification_time
-    FROM verification_logs
-    WHERE user_id = ?
-    ORDER BY verification_time DESC
-    LIMIT ?
-    ''', (user_id, limit))
+    user_logs = [log for log in logs if log['user_id'] == user_id]
+    user_logs.sort(key=lambda x: x['verification_time'], reverse=True)
     
-    history = cursor.fetchall()
-    conn.close()
-    return history
+    return [(log['log_id'], log['result'], log['confidence_score'], log['verification_time']) 
+            for log in user_logs[:limit]]
+
+def load_dataset_from_zip(zip_file):
+    """Load dataset from ZIP file"""
+    dataset = []
+    genuine_count = 0
+    forged_count = 0
+    
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        for root, dirs, files in os.walk(temp_dir):
+            if root == temp_dir:
+                continue
+            
+            folder_name = os.path.basename(root)
+            
+            if folder_name.startswith('.') or folder_name == '__MACOSX':
+                continue
+            
+            is_genuine = not folder_name.endswith('_forg')
+            label = 1 if is_genuine else 0
+            
+            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG', '.BMP')
+            
+            for filename in files:
+                if filename.endswith(image_extensions) and not filename.startswith('.'):
+                    img_path = os.path.join(root, filename)
+                    
+                    try:
+                        image = Image.open(img_path)
+                        
+                        # Convert to bytes
+                        img_byte_arr = io.BytesIO()
+                        image.save(img_byte_arr, format='PNG')
+                        img_bytes = img_byte_arr.getvalue()
+                        
+                        dataset.append({
+                            'folder': folder_name,
+                            'filename': filename,
+                            'image_bytes': img_bytes,
+                            'label': label,
+                            'label_text': 'Genuine' if is_genuine else 'Forged'
+                        })
+                        
+                        if is_genuine:
+                            genuine_count += 1
+                        else:
+                            forged_count += 1
+                    except Exception as e:
+                        st.warning(f"Could not load {filename}: {str(e)}")
+        
+        shutil.rmtree(temp_dir)
+        
+        if len(dataset) == 0:
+            return dataset, "No valid images found"
+        
+        return dataset, f"Loaded {len(dataset)} images ({genuine_count} genuine, {forged_count} forged)"
+        
+    except Exception as e:
+        shutil.rmtree(temp_dir)
+        return [], f"Error: {str(e)}"
+
+def save_training_data(dataset):
+    """Save training dataset"""
+    data = load_data(DATASET_FILE)
+    
+    # Clear existing data
+    data['images'] = []
+    
+    # Count folders
+    folders = set([d['folder'] for d in dataset])
+    
+    # Save dataset
+    data['images'] = dataset
+    data['statistics'] = {
+        'genuine': sum(1 for d in dataset if d['label'] == 1),
+        'forged': sum(1 for d in dataset if d['label'] == 0),
+        'total': len(dataset),
+        'folders': len(folders)
+    }
+    
+    save_data(DATASET_FILE, data)
+    return len(dataset)
+
+def get_training_statistics():
+    """Get training data statistics"""
+    data = load_data(DATASET_FILE)
+    return data['statistics']
+
+def get_sample_images(count=3):
+    """Get sample images from dataset"""
+    data = load_data(DATASET_FILE)
+    images = data['images']
+    
+    genuine = [d for d in images if d['label'] == 1][:count]
+    forged = [d for d in images if d['label'] == 0][:count]
+    
+    return genuine, forged
 
 # Session state
 if 'logged_in' not in st.session_state:
@@ -406,12 +377,13 @@ if 'user_type' not in st.session_state:
 if 'page' not in st.session_state:
     st.session_state.page = 'login'
 
-# Initialize database
-init_database()
+# Initialize storage
+init_storage()
 
 # Login Page
 if not st.session_state.logged_in:
     st.title("✍️ Signature Verification System")
+    st.info("🔒 **Persistent Storage Enabled** - All data is saved permanently!")
     
     tab1, tab2 = st.tabs(["Login", "Register"])
     
@@ -436,7 +408,7 @@ if not st.session_state.logged_in:
             else:
                 st.warning("Please enter both username and password")
         
-        st.info("**Default Admin Login:** Username: `admin`, Password: `admin123`")
+        st.info("**Default Admin:** Username: `admin`, Password: `admin123`")
     
     with tab2:
         st.subheader("Create New Account")
@@ -465,6 +437,7 @@ else:
     with st.sidebar:
         st.title("Navigation")
         st.write(f"**Welcome, {st.session_state.full_name}!**")
+        st.success("✅ Persistent Storage Active")
         st.divider()
         
         if st.button("🏠 Dashboard", use_container_width=True):
@@ -531,7 +504,7 @@ else:
                 with col2:
                     st.write(f"**{log[2]:.1f}%**")
                 with col3:
-                    st.write(f"*{log[3]}*")
+                    st.write(f"*{log[3][:19]}*")
         else:
             st.info("No recent activity")
     
@@ -548,7 +521,7 @@ else:
         else:
             st.info(f"You have {len(templates)} template(s)")
             
-            uploaded_file = st.file_uploader("Upload Signature to Verify", type=['png', 'jpg', 'jpeg'])
+            uploaded_file = st.file_uploader("Upload Signature", type=['png', 'jpg', 'jpeg'])
             
             if uploaded_file:
                 image = Image.open(uploaded_file)
@@ -563,26 +536,26 @@ else:
                     processed = simple_preprocess(image)
                     st.image(processed, use_container_width=True, clamp=True)
                 
-                if st.button("🔍 Verify Signature", use_container_width=True):
+                if st.button("🔍 Verify", use_container_width=True):
                     with st.spinner("Verifying..."):
                         result, confidence = verify_signature(st.session_state.user_id, image)
                         log_verification(st.session_state.user_id, image, result, confidence)
                         
                         st.divider()
                         if result == "Genuine":
-                            st.success(f"✅ **GENUINE SIGNATURE**")
+                            st.success(f"✅ **GENUINE**")
                             st.success(f"Confidence: **{confidence:.1f}%**")
                         else:
-                            st.error(f"❌ **FORGED SIGNATURE**")
+                            st.error(f"❌ **FORGED**")
                             st.error(f"Confidence: **{confidence:.1f}%**")
                         
                         st.progress(confidence / 100)
     
     elif st.session_state.page == 'templates':
-        st.title("📂 Signature Templates")
+        st.title("📂 Templates")
         
         st.subheader("Add New Template")
-        uploaded = st.file_uploader("Upload Signature Template", type=['png', 'jpg', 'jpeg'])
+        uploaded = st.file_uploader("Upload Template", type=['png', 'jpg', 'jpeg'])
         
         if uploaded:
             image = Image.open(uploaded)
@@ -595,9 +568,9 @@ else:
                 processed = simple_preprocess(image)
                 st.image(processed, caption="Processed", use_container_width=True, clamp=True)
             
-            if st.button("💾 Save Template", use_container_width=True):
+            if st.button("💾 Save", use_container_width=True):
                 save_signature_template(st.session_state.user_id, image)
-                st.success("Template saved!")
+                st.success("Template saved permanently!")
                 st.rerun()
         
         st.divider()
@@ -632,7 +605,7 @@ else:
                 with col3:
                     st.write(f"**{log[2]:.1f}%**")
                 with col4:
-                    st.write(log[3])
+                    st.write(log[3][:19])
             
             st.divider()
             genuine = sum(1 for h in history if h[1] == 'Genuine')
@@ -647,68 +620,63 @@ else:
             st.info("No history yet")
     
     elif st.session_state.page == 'dataset' and st.session_state.user_type == 'admin':
-        st.title("📥 Load Training Dataset (ZIP Upload)")
+        st.title("📥 Load Dataset (ZIP)")
         
         st.markdown("""
-        ### How to Prepare Your Dataset ZIP File:
+        ### Dataset Structure:
         
-        1. **Create folders with this structure:**
-           - `001/` - Genuine signatures (person 1)
-           - `001_forg/` - Forged signatures (person 1)
-           - `002/` - Genuine signatures (person 2)
-           - `002_forg/` - Forged signatures (person 2)
-           - Continue this pattern...
+        1. **Create folders:**
+           - `001/` - Genuine signatures
+           - `001_forg/` - Forged signatures
+           - `002/`, `002_forg/`, etc.
         
-        2. **ZIP the parent folder** containing all these subfolders
+        2. **ZIP** the parent folder
         
-        3. **Upload the ZIP file** below
+        3. **Upload** the ZIP file below
         
         **Rules:**
-        - Folders WITHOUT `_forg` = Genuine signatures ✅
-        - Folders WITH `_forg` = Forged signatures ❌
-        - Supported: PNG, JPG, JPEG, BMP
+        - WITHOUT `_forg` = Genuine ✅
+        - WITH `_forg` = Forged ❌
         """)
         
         st.divider()
         
-        zip_file = st.file_uploader(
-            "Upload Dataset ZIP File",
-            type=['zip'],
-            help="Upload a ZIP file containing your signature dataset folders"
-        )
+        zip_file = st.file_uploader("Upload Dataset ZIP", type=['zip'])
         
         if zip_file is not None:
-            if st.button("📂 Load Dataset from ZIP", use_container_width=True):
-                with st.spinner("Processing ZIP file..."):
+            if st.button("📂 Load from ZIP", use_container_width=True):
+                with st.spinner("Processing..."):
                     dataset, message = load_dataset_from_zip(zip_file)
                     
                     if dataset:
                         st.success(message)
                         
-                        # Show samples
-                        st.subheader("Sample Images")
+                        genuine_samples, forged_samples = get_sample_images(3)
                         
-                        genuine_samples = [d for d in dataset if d['label'] == 1][:3]
-                        forged_samples = [d for d in dataset if d['label'] == 0][:3]
+                        # Show genuine samples using saved bytes
+                        if len(dataset) > 0:
+                            genuine_imgs = [d for d in dataset if d['label'] == 1][:3]
+                            if genuine_imgs:
+                                st.write("**Genuine Samples:**")
+                                cols = st.columns(len(genuine_imgs))
+                                for idx, sample in enumerate(genuine_imgs):
+                                    with cols[idx]:
+                                        img = Image.open(io.BytesIO(sample['image_bytes']))
+                                        st.image(img, caption=sample['folder'], use_container_width=True)
+                            
+                            forged_imgs = [d for d in dataset if d['label'] == 0][:3]
+                            if forged_imgs:
+                                st.write("**Forged Samples:**")
+                                cols = st.columns(len(forged_imgs))
+                                for idx, sample in enumerate(forged_imgs):
+                                    with cols[idx]:
+                                        img = Image.open(io.BytesIO(sample['image_bytes']))
+                                        st.image(img, caption=sample['folder'], use_container_width=True)
                         
-                        if genuine_samples:
-                            st.write("**Genuine:**")
-                            cols = st.columns(len(genuine_samples))
-                            for idx, sample in enumerate(genuine_samples):
-                                with cols[idx]:
-                                    st.image(sample['image'], caption=sample['folder'], use_container_width=True)
-                        
-                        if forged_samples:
-                            st.write("**Forged:**")
-                            cols = st.columns(len(forged_samples))
-                            for idx, sample in enumerate(forged_samples):
-                                with cols[idx]:
-                                    st.image(sample['image'], caption=sample['folder'], use_container_width=True)
-                        
-                        if st.button("💾 Save to Database", use_container_width=True):
+                        if st.button("💾 Save Permanently", use_container_width=True):
                             with st.spinner("Saving..."):
                                 saved = save_training_data(dataset)
-                                st.success(f"Saved {saved} images!")
+                                st.success(f"✅ Saved {saved} images permanently!")
                                 st.balloons()
                                 st.rerun()
                     else:
