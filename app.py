@@ -363,6 +363,74 @@ def get_sample_images(count=3):
     
     return genuine, forged
 
+def get_dataset_folders():
+    """Get list of unique folders from dataset"""
+    data = load_data(DATASET_FILE)
+    images = data['images']
+    
+    # Get unique folders (excluding _forg variants)
+    folders = {}
+    for img in images:
+        folder = img['folder']
+        if not folder.endswith('_forg'):
+            if folder not in folders:
+                folders[folder] = {'genuine': [], 'forged': []}
+    
+    # Group images by folder
+    for img in images:
+        folder_base = img['folder'].replace('_forg', '')
+        if folder_base in folders:
+            if img['label'] == 1:
+                folders[folder_base]['genuine'].append(img)
+            else:
+                folders[folder_base]['forged'].append(img)
+    
+    return folders
+
+def create_templates_from_dataset(user_id, folder_name, count=5):
+    """Create user templates from dataset folder"""
+    data = load_data(DATASET_FILE)
+    images = data['images']
+    
+    # Get genuine images from this folder
+    genuine_images = [img for img in images if img['folder'] == folder_name and img['label'] == 1]
+    
+    if not genuine_images:
+        return 0
+    
+    # Take first 'count' images
+    selected = genuine_images[:count]
+    
+    # Convert to templates
+    templates = load_data(TEMPLATES_FILE)
+    if user_id not in templates:
+        templates[user_id] = []
+    
+    saved = 0
+    for img_data in selected:
+        try:
+            # Load image from bytes
+            image = Image.open(io.BytesIO(img_data['image_bytes']))
+            
+            # Extract features
+            features = extract_features(image)
+            
+            # Add to templates
+            template_id = len(templates[user_id]) + 1
+            templates[user_id].append({
+                'template_id': template_id,
+                'signature_image': img_data['image_bytes'],
+                'feature_vector': features.tolist(),
+                'created_at': datetime.now().isoformat(),
+                'is_active': 1
+            })
+            saved += 1
+        except Exception as e:
+            st.error(f"Error creating template: {str(e)}")
+    
+    save_data(TEMPLATES_FILE, templates)
+    return saved
+
 # Session state
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
@@ -450,6 +518,10 @@ else:
         
         if st.button("📂 My Templates", use_container_width=True):
             st.session_state.page = 'templates'
+            st.rerun()
+        
+        if st.button("🎯 Use Dataset Templates", use_container_width=True):
+            st.session_state.page = 'dataset_templates'
             st.rerun()
         
         if st.button("📊 History", use_container_width=True):
@@ -618,6 +690,99 @@ else:
             col3.metric("Avg Confidence", f"{avg_conf:.1f}%")
         else:
             st.info("No history yet")
+    
+    elif st.session_state.page == 'dataset_templates':
+        st.title("🎯 Use Dataset as Templates")
+        
+        st.info("💡 Select a person from the loaded dataset to use their genuine signatures as your templates")
+        
+        stats = get_training_statistics()
+        
+        if stats['total'] == 0:
+            st.warning("⚠️ No dataset loaded yet!")
+            st.write("Please ask admin to load dataset first.")
+            if st.button("Go to Dashboard"):
+                st.session_state.page = 'dashboard'
+                st.rerun()
+        else:
+            st.success(f"✅ Dataset loaded: {stats['total']} images ({stats['folders']} people)")
+            
+            # Get available folders
+            folders = get_dataset_folders()
+            
+            if folders:
+                st.subheader("Select a Person")
+                
+                # Create selection
+                folder_names = list(folders.keys())
+                selected_folder = st.selectbox(
+                    "Choose person ID:",
+                    folder_names,
+                    format_func=lambda x: f"Person {x} ({len(folders[x]['genuine'])} genuine, {len(folders[x]['forged'])} forged)"
+                )
+                
+                if selected_folder:
+                    st.divider()
+                    
+                    folder_data = folders[selected_folder]
+                    
+                    # Show samples
+                    st.subheader(f"Person {selected_folder} - Signatures")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**✅ Genuine Signatures ({len(folder_data['genuine'])})**")
+                        if folder_data['genuine']:
+                            # Show first 3 genuine
+                            display_count = min(3, len(folder_data['genuine']))
+                            cols = st.columns(display_count)
+                            for idx in range(display_count):
+                                with cols[idx]:
+                                    img = Image.open(io.BytesIO(folder_data['genuine'][idx]['image_bytes']))
+                                    st.image(img, use_container_width=True)
+                    
+                    with col2:
+                        st.write(f"**❌ Forged Signatures ({len(folder_data['forged'])})**")
+                        if folder_data['forged']:
+                            # Show first 3 forged
+                            display_count = min(3, len(folder_data['forged']))
+                            cols = st.columns(display_count)
+                            for idx in range(display_count):
+                                with cols[idx]:
+                                    img = Image.open(io.BytesIO(folder_data['forged'][idx]['image_bytes']))
+                                    st.image(img, use_container_width=True)
+                    
+                    st.divider()
+                    
+                    # Option to create templates
+                    if folder_data['genuine']:
+                        st.subheader("Create Templates from Genuine Signatures")
+                        
+                        max_templates = len(folder_data['genuine'])
+                        num_templates = st.slider(
+                            "How many templates to create?",
+                            min_value=1,
+                            max_value=min(max_templates, 10),
+                            value=min(5, max_templates),
+                            help="Recommended: 3-5 templates for best accuracy"
+                        )
+                        
+                        st.info(f"This will create {num_templates} templates from the genuine signatures of Person {selected_folder}")
+                        
+                        if st.button(f"✅ Create {num_templates} Templates", use_container_width=True):
+                            with st.spinner("Creating templates..."):
+                                created = create_templates_from_dataset(st.session_state.user_id, selected_folder, num_templates)
+                                if created > 0:
+                                    st.success(f"✅ Created {created} templates successfully!")
+                                    st.balloons()
+                                    st.info("You can now verify signatures against these templates!")
+                                else:
+                                    st.error("Failed to create templates")
+                    else:
+                        st.warning(f"No genuine signatures found for Person {selected_folder}")
+            else:
+                st.warning("No valid folders found in dataset")
     
     elif st.session_state.page == 'dataset' and st.session_state.user_type == 'admin':
         st.title("📥 Load Dataset (ZIP)")
